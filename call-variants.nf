@@ -17,7 +17,6 @@ params.ref = "./referenceGenome/Sviridis_500_v2.1/assembly/Sviridis_500_v2.0.fa.
 
 //variant caller to use ('mpileup' for bcftools_mpileup or 'gatk' for gatk_haplotypecaller)
 variantCaller = 'mpileup'
-params.variantCaller = "mpileup"
 
 /*
  * Processes
@@ -287,7 +286,7 @@ process gzipAndSave {
 		path("*.gz")
 	
 	"""
-	gzip -c $inputFile > $inputFile.gz
+	gzip -c $inputFile > ${inputFile}.gz
 	"""
 }
 
@@ -305,13 +304,13 @@ process splitVariants {
 		path vcfFile
 	
 	output:
-		path("*.snps.vcf.gz"), emit: snps
-		path("*.indels.vcf.gz"), emit: indels
+		path("*.snps.vcf"), emit: snps
+		path("*.indels.vcf"), emit: indels
 	
 	"""
 	module load GATK/gatk-4.1.8.1
 	source /share/pkg/condas/2018-05-11/bin/activate && conda activate gatk_4.1.8.1
-	gatk --java-options "-Xmx4g" SplitVcfs -I $vcfFile --INDEL_OUTPUT ${params.id}.${variantCaller}.indels.vcf.gz --SNP_OUTPUT ${params.id}.${variantCaller}.snps.vcf.gz
+	gatk --java-options "-Xmx4g" SplitVcfs -I $vcfFile --INDEL_OUTPUT ${params.id}.${variantCaller}.indels.vcf --SNP_OUTPUT ${params.id}.${variantCaller}.snps.vcf --STRICT false
 	"""
 }
 
@@ -330,31 +329,88 @@ process filterVariants {
 		path indels
 	
 	output:
-		path("*.combined.filtered.vcf.gz")
+		path("*.snps.filtered.vcf"), emit: snpsFiltered
+		path("*.indels.filtered.vcf"), emit: indelsFiltered
 	
 	script:
-	if( $variantCaller == 'mpileup' )
+	if( variantCaller == 'mpileup' )
 		"""
-		module load python/3.5.0
+		module load python3/3.5.0
 		module load bcftools/1.9
-		bcftools view -e 'QUAL <= 20 || DP < 2 || DP > 50' $snps -Ov -o snps.filtered.vcf
-		bcftools view -e 'DP < 2 || DP > 50 || IMF < 0.1' $indels -Ov -o indels.filtered.vcf
-		bcftools concat -n -Oz -o ${params.id}.${variantCaller}.combined.filtered.vcf.gz snps.filtered.vcf indels.filtered.vcf
+		#snp specific filtering - calculate allele frequency, filter for homozygous mutations.
+		bcftools +fill-tags $snps -- -t AF | bcftools view -e 'AF <= 0.5 || QUAL <= 10 || DP < 2 || DP > 100' -Ov -o ${params.id}.${variantCaller}.snps.filtered.vcf
+		#indel speciic filtering - calculate allele frequency, filter for homozygous mutations.
+		bcftools +fill-tags $indels -- -t AF | bcftools view -e 'AF <= 0.5 || DP < 2 || DP > 100 || IMF < 0.1' -Ov -o ${params.id}.${variantCaller}.indels.filtered.vcf
 		"""
-
-	else if( $variantCaller == 'gatk' )
+		
+	else if( variantCaller == 'gatk' )
 		"""
-		module load GATK/gatk-4.1.8.1
-		source /share/pkg/condas/2018-05-11/bin/activate && conda activate gatk_4.1.8.1
-		gatk VariantFiltration -V $snps -O snps.filtered.gatk.vcf \
-			-filter "QD < 2" --filter-name "QD2" \
-			-filter "QUAL <= 20" --filter-name "QUAL20"
-		gatk VariantFiltration -V $indels -O indels.filtered.gatk.vcf \
-			-filter "QD < 2" --filter-name "QD2"
+		module load python3/3.5.0
+		module load bcftools/1.9
+		#allele freq already annotated
+		bcftools view $snps -e 'AF <= 0.5 || QUAL <= 10 || QD < 2 || INFO/DP > 100' -Ov -o ${params.id}.${variantCaller}.snps.filtered.vcf
+		bcftools view $indels -e 'AF <= 0.5 || QD < 2 || INFO/DP > 100' -Ov -o ${params.id}.${variantCaller}.indels.filtered.vcf
 		"""
+		
 	else
-		error "Invalid variantCaller parameter $variantCaller"
+		error "Invalid variantCaller parameter."
 }
+
+process mergeVariants {
+	tag {"mergeVariants $snpsFiltered $indelsFiltered"}
+	executor 'lsf'
+	queue 'short'
+	clusterOptions '-R "rusage[mem=10000]" "span[hosts=1]"'
+	cpus 1
+	time '1h'
+	
+	publishDir "sequenceData", mode: 'copy'
+	
+	input:
+		path snpsFiltered
+		path indelsFiltered
+	
+	output:
+		path("*.combined.vcf")
+	
+	"""
+	module load GATK/gatk-4.1.8.1
+	source /share/pkg/condas/2018-05-11/bin/activate && conda activate gatk_4.1.8.1
+	gatk MergeVcfs -I $snpsFiltered -I $indelsFiltered -O ${params.id}.${variantCaller}.combined.vcf
+	"""
+}
+
+process graphVariantFreq {
+	tag {"graphVariantFreq $combinedVcf"}
+	executor 'lsf'
+	queue 'short'
+	clusterOptions '-R "rusage[mem=10000]" "span[hosts=1]"'
+	cpus 1
+	time '1h'
+	
+	publishDir "results", mode: 'copy'
+	
+	input:
+		path combinedVcf
+	
+	output:
+		path("*.pdf")
+	
+	script:
+	"""
+	module load R/3.6.1
+	module load gcc/8.1.0
+	module load R/3.6.1_packages/tidyverse/1.3.0
+	#extract chromosome lengths from vcf
+	head -100 $combinedVcf | grep -oP '(?<=#contig=<ID=).*?(?=,)' > chr_names.txt
+	head -100 $combinedVcf | grep -oP '(?<=length=).*?(?=>)' > chr_lengths.txt
+	#make a 2 column tsv file recording the chromosome and coordinate location of each variant
+	awk '!/##/' $combinedVcf | awk -v OFS='\t' '{print \$1, \$2}' | sed 's/#//' > variantLocations.tsv
+	#start R and make graphs for each chromosome
+	variant_graphing.R ${combinedVcf}
+	
+	"""
+}	
 
 /*
  * Workflow
@@ -383,9 +439,12 @@ workflow {
 	
 	//call variants using HaplotypeCaller
 	callVariants( unzipRef.out, indexRef.out, makeRefDict.out, indexBam.out, addReadGroups.out )
-	gzipAndSave( callVariants.out )
 	
 	//filter variants
 	splitVariants( callVariants.out )
 	filterVariants( splitVariants.out.snps, splitVariants.out.indels )
+	mergeVariants( filterVariants.out.snpsFiltered, filterVariants.out.indelsFiltered )
+	
+	//graph homozygous variant frequency by chromosome
+	graphVariantFreq( mergeVariants.out )
 }
