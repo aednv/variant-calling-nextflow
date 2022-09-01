@@ -16,7 +16,13 @@ params.reads = "./sequenceData/brl2.fastq"
 params.ref = "./referenceGenome/Sviridis_500_v2.1/assembly/Sviridis_500_v2.0.fa.gz"
 
 //variant caller to use ('mpileup' for bcftools_mpileup or 'gatk' for gatk_haplotypecaller)
-variantCaller = 'mpileup'
+variantCaller = 'gatk'
+
+//snpEff database name for variant annotation
+snpDb = 'Sviridis.v2'
+
+//snpEff path
+snpEffPath = "/project/uma_madelaine_bartlett/AmberDeneve/snpEff/snpEff/snpEff.jar"
 
 /*
  * Processes
@@ -410,7 +416,30 @@ process graphVariantFreq {
 	variant_graphing.R ${combinedVcf}
 	
 	"""
-}	
+}
+
+process annotateSnps {
+	tag {"annotateSnps $combinedVcf"}
+	executor 'lsf'
+	queue 'short'
+	clusterOptions '-R "rusage[mem=10000]" "span[hosts=1]"'
+	cpus 1
+	time '2h'
+	
+	publishDir "results", mode: 'copy'
+	
+	input:
+		path combinedVcf
+	
+	output:
+		path("*")
+		
+	"""
+	module load snpEff_snpSift/4.3T
+	java -Xmx8g -jar $snpEffPath $snpDb $combinedVcf > ${params.id}.${variantCaller}.combined.ann.vcf
+	cat ${params.id}.${variantCaller}.combined.ann.vcf | grep 'HIGH' > ${params.id}.${variantCaller}.combined.ann.high.vcf
+	"""
+}
 
 /*
  * Workflow
@@ -447,4 +476,7 @@ workflow {
 	
 	//graph homozygous variant frequency by chromosome
 	graphVariantFreq( mergeVariants.out )
+	
+	//snpEff annotation
+	annotateSnps( mergeVariants.out )
 }
