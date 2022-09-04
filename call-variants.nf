@@ -16,7 +16,7 @@ params.reads = "./sequenceData/brl2.fastq"
 params.ref = "./referenceGenome/Sviridis_500_v2.1/assembly/Sviridis_500_v2.0.fa.gz"
 
 //variant caller to use ('mpileup' for bcftools_mpileup or 'gatk' for gatk_haplotypecaller)
-variantCaller = 'gatk'
+variantCaller = 'mpileup'
 
 //snpEff database name for variant annotation
 snpDb = 'Sviridis.v2'
@@ -441,6 +441,27 @@ process annotateSnps {
 	"""
 }
 
+process removeHighDensityVar {
+	tag {"removeHighDensity $combinedVcf"}
+	executor 'lsf'
+	queue 'short'
+	cpus 1
+	time '2h'
+	
+	publishDir "results", mode: 'copy'
+	
+	input:
+		path combinedVcf
+	
+	output:
+		path("isec_dir/*.vcf")
+	
+	"""
+	module load bcftools/1.9
+	filterHighDensitySnps.sh $combinedVcf
+	"""
+}
+
 /*
  * Workflow
  */
@@ -473,10 +494,10 @@ workflow {
 	splitVariants( callVariants.out )
 	filterVariants( splitVariants.out.snps, splitVariants.out.indels )
 	mergeVariants( filterVariants.out.snpsFiltered, filterVariants.out.indelsFiltered )
-	
+	removeHighDensityVar( mergeVariants.out )
 	//graph homozygous variant frequency by chromosome
-	graphVariantFreq( mergeVariants.out )
+	graphVariantFreq( removeHighDensityVar.out )
 	
 	//snpEff annotation
-	annotateSnps( mergeVariants.out )
+	annotateSnps( removeHighDensityVar.out )
 }
